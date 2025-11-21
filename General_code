@@ -1,0 +1,670 @@
+import os
+import time
+import math
+import random
+import pickle
+import itertools
+from collections import defaultdict, namedtuple
+
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+import pandas as pd
+
+# ====================== Importazione LKH ======================
+try:
+    # Si assume che pylkh sia installato e utilizzabile in questo modo
+    import lkh
+    LKH_AVAILABLE = True
+    print("[LKH] Libreria pylkh importata con successo.")
+except ImportError:
+    LKH_AVAILABLE = False
+    print("[LKH] Attenzione: la libreria pylkh non è stata trovata. Verrà utilizzato 'LKH-inspired' come fallback.")
+# =============================================================
+
+# ====================== Start wall-time timer ======================
+wall_t0 = time.perf_counter()
+
+# =================================================================================
+# --- CONFIGURAZIONE DELLA SIMULAZIONE ---
+# L'utente può modificare questi parametri per controllare l'esperimento.
+# =================================================================================
+
+# 1. Dimensioni del magazzino (righe, colonne)
+#    - Piccolo: (10, 20)
+#    - Medio:   (36, 48)
+#    - Grande:  (100, 200)
+ROWS, COLS = 100, 200
+
+# 2. Quantità di pick da analizzare in ogni simulazione
+#    (TSP* verrà eseguito solo per valori <= 13)
+PICK_SIZES = [10, 12, 15, 20, 25, 30]
+
+# 3. Numero di ordini casuali da generare per ogni dimensione di pick
+NUM_ORDERS_PER_SIZE = 500
+
+# 4. Numero di mappe di percorso da visualizzare per ogni dimensione di pick
+NUM_ORDERS_TO_PLOT = 2
+
+# =================================================================================
+# --- GENERAZIONE DINAMICA DEL LAYOUT ---
+# =================================================================================
+
+print(f"\nGenerazione magazzino con dimensioni: {ROWS}x{COLS}...")
+
+# Parametri di layout
+CELL_SIZE_M = 1.0
+FORKLIFT_SPEED_M_S = 1.5
+
+# Aggiunta di corridoi centrali solo se il magazzino è sufficientemente grande
+HAS_CENTRAL_CORRIDOR = ROWS > 30
+H_CORRIDORS = [0, ROWS - 1]
+if HAS_CENTRAL_CORRIDOR:
+    # Aggiunge corridoi orizzontali ogni 18 righe circa
+    H_CORRIDORS.extend(list(range(18, ROWS, 18)))
+    H_CORRIDORS = sorted(list(set(H_CORRIDORS)))
+    print(f"[Layout] Rilevato magazzino di grandi dimensioni. Corridoi centrali attivati alle righe: {H_CORRIDORS}")
+else:
+    print("[Layout] Rilevato magazzino di piccole dimensioni. Nessun corridoio centrale.")
+
+# Inizializza la griglia
+grid = np.ones((ROWS, COLS), dtype=int) # 1 = Scaffale
+
+# Crea corridoi verticali (schema: 2 scaffali, 1 corridoio)
+v_corridors = [c for c in range(COLS) if c % 3 == 1]
+for c in v_corridors:
+    grid[:, c] = 0 # 0 = Corridoio
+
+# Crea corridoi orizzontali
+for r in H_CORRIDORS:
+    grid[r, :] = 0
+
+# --- Depot ---
+DEPOT_NODE = (ROWS - 1, COLS // 2)
+DEPOT_COSMETIC = (ROWS + 1.0, COLS // 2) # Usato solo per il plotting
+
+# --- Generazione celle di picking ---
+picking_cells = []
+for r in range(ROWS):
+    for c in range(COLS):
+        if grid[r, c] == 1:
+            picking_cells.append((r, c))
+
+pick_id_of = {rc: i+1 for i, rc in enumerate(picking_cells)}
+pick_cell_by_id = {i+1: rc for i, rc in enumerate(picking_cells)}
+print(f"Layout generato con {len(picking_cells)} celle di picking disponibili.")
+
+# Creazione del grafo NetworkX basato sui corridoi
+G = nx.Graph()
+for r in range(ROWS):
+    for c in range(COLS):
+        if grid[r, c] == 0:
+            G.add_node((r, c))
+            for dr, dc in [(1,0), (-1,0), (0,1), (0,-1)]:
+                nr, nc = r+dr, c+dc
+                if 0 <= nr < ROWS and 0 <= nc < COLS and grid[nr, nc] == 0:
+                    G.add_edge((r, c), (nr, nc))
+
+assert grid[DEPOT_NODE] == 0, "Il depot deve trovarsi su una cella di corridoio!"
+
+# ====================== Gestione Cache ======================
+CACHE_FILE = f"warehouse_cache_{ROWS}x{COLS}.pkl"
+_cache = {"dist_len": {}, "dist_path": {}, "PP": {}}
+
+def _load_cache():
+    global _cache
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "rb") as f:
+                data = pickle.load(f)
+            for k, v in data.items():
+                _cache[k] = v
+            print(f"[Cache] Cache caricata con successo da {CACHE_FILE}")
+        except Exception as e:
+            print(f"[Cache] Errore nel caricamento della cache: {e}. Si riparte da capo.")
+    else:
+        print("[Cache] Nessun file di cache trovato. Si parte da capo.")
+
+def _save_cache():
+    try:
+        with open(CACHE_FILE, "wb") as f:
+            pickle.dump(_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[Cache] Cache salvata correttamente in {CACHE_FILE}")
+    except Exception as e:
+        print(f"[Cache] Errore nel salvataggio della cache: {e}")
+
+_load_cache()
+
+# ====================== Funzioni di Utilità (Distane, Percorsi, ecc.) ======================
+def sp_len_cached(a, b):
+    key = tuple(sorted((a, b)))
+    if key not in _cache["dist_len"]:
+        _cache["dist_len"][key] = nx.shortest_path_length(G, a, b)
+    return _cache["dist_len"][key]
+
+def sp_path_cached(a, b):
+    if (a, b) not in _cache["dist_path"]:
+        _cache["dist_path"][(a, b)] = nx.shortest_path(G, a, b)
+    return _cache["dist_path"][(a, b)]
+
+def adjacent_corridor_of_pick(r, c):
+    for dc in (-1, 1):
+        nc = c + dc
+        if 0 <= nc < COLS and grid[r, nc] == 0:
+            return (r, nc)
+    raise RuntimeError(f"La cella di picking ({r},{c}) non ha un corridoio adiacente.")
+
+def build_D_with_PP(pick_corr_nodes, depot_node):
+    tsp_nodes = [depot_node] + list(pick_corr_nodes)
+    n = len(tsp_nodes)
+    D = np.zeros((n, n), dtype=int)
+    # Distanze da/per il depot
+    for j in range(1, n):
+        d = sp_len_cached(tsp_nodes[0], tsp_nodes[j])
+        D[0, j] = D[j, 0] = d
+    # Matrice delle distanze tra i punti di pick
+    key_pp = tuple(sorted(pick_corr_nodes))
+    if key_pp not in _cache["PP"]:
+        m = n - 1
+        PP = np.zeros((m, m), dtype=int)
+        for i in range(m):
+            for j in range(i + 1, m):
+                d = sp_len_cached(tsp_nodes[i + 1], tsp_nodes[j + 1])
+                PP[i, j] = PP[j, i] = d
+        _cache["PP"][key_pp] = PP
+    D[1:, 1:] = _cache["PP"][key_pp]
+    return tsp_nodes, D
+
+def polyline_from_tour(tsp_nodes, tour_idx):
+    if not tour_idx or len(tour_idx) < 2: return []
+    seq = []
+    u = tsp_nodes[tour_idx[0]]
+    for t in tour_idx[1:]:
+        v = tsp_nodes[t]
+        seg = sp_path_cached(u, v)
+        seq.extend(seg if not seq else seg[1:])
+        u = v
+    return seq
+
+# ====================== Algoritmi di Routing (TSP Solvers) ======================
+
+def tour_cost(D, tour):
+    return sum(D[tour[i], tour[i+1]] for i in range(len(tour)-1))
+
+def spatially_coherent_tour(tsp_nodes, depot_node):
+    picks = [(i, tsp_nodes[i]) for i in range(1, len(tsp_nodes))]
+    aisles = defaultdict(list)
+    for idx, (r, c) in picks:
+        aisles[c].append((r, idx))
+
+    sorted_aisles = sorted(aisles.items())
+    depot_c = depot_node[1]
+
+    # Trova il corridoio più vicino al depot per iniziare
+    closest_aisle_idx = min(range(len(sorted_aisles)), key=lambda i: abs(sorted_aisles[i][0] - depot_c))
+
+    ordered_aisles = [sorted_aisles[closest_aisle_idx]]
+    left, right = closest_aisle_idx - 1, closest_aisle_idx + 1
+    while left >= 0 or right < len(sorted_aisles):
+        if right < len(sorted_aisles):
+            ordered_aisles.append(sorted_aisles[right])
+            right += 1
+        if left >= 0:
+            ordered_aisles.insert(0, sorted_aisles[left])
+            left -= 1
+
+    tour, direction_down = [0], True
+    for _, picks_in_aisle in ordered_aisles:
+        picks_in_aisle.sort(key=lambda p: p[0], reverse=direction_down)
+        tour.extend([idx for r, idx in picks_in_aisle])
+        direction_down = not direction_down # Alterna la direzione
+    tour.append(0)
+    return tour
+
+def two_opt_swap(tour, i, k):
+    return tour[:i] + tour[i:k+1][::-1] + tour[k+1:]
+
+def calculate_2opt_delta(D, tour, i, k):
+    a, b = tour[i-1], tour[i]
+    c, d = tour[k], tour[k+1]
+    return (D[a, c] + D[b, d]) - (D[a, b] + D[c, d])
+
+def tabu_search_tsp(D, tsp_nodes, depot_node, iters=100, tabu_size=20, max_neighbors=1500):
+    cur = spatially_coherent_tour(tsp_nodes, depot_node)
+    cur_cost = tour_cost(D, cur)
+    best, best_cost = cur[:], cur_cost
+    tabu, n_nodes = [], len(cur) - 1
+
+    all_swaps = [(i, k) for i in range(1, n_nodes - 1) for k in range(i + 1, n_nodes)]
+
+    for _ in range(iters):
+        move_best, best_delta = None, math.inf
+
+        # Campiona il vicinato se è troppo grande
+        sampled_swaps = random.sample(all_swaps, min(len(all_swaps), max_neighbors))
+
+        for i, k in sampled_swaps:
+            delta = calculate_2opt_delta(D, cur, i, k)
+            is_tabu = (i, k) in tabu
+
+            if delta < best_delta and (not is_tabu or cur_cost + delta < best_cost):
+                best_delta, move_best = delta, (i, k)
+
+        if move_best is None:
+            break
+
+        i, k = move_best
+        cur, cur_cost = two_opt_swap(cur, i, k), cur_cost + best_delta
+
+        tabu.append((i, k))
+        if len(tabu) > tabu_size:
+            tabu.pop(0)
+
+        if cur_cost < best_cost:
+            best, best_cost = cur[:], cur_cost
+
+    return best, best_cost
+
+def lkh_inspired_tsp(D, tsp_nodes, depot_node, rounds=10):
+    best, best_cost = None, math.inf
+    n = D.shape[0]
+    nodes = list(range(1, n))
+    rng = random.Random(42) # Seed per riproducibilità
+
+    initial_tours = [spatially_coherent_tour(tsp_nodes, depot_node)]
+    for _ in range(rounds - 1):
+        initial_tours.append([0] + rng.sample(nodes, len(nodes)) + [0])
+
+    for tour in initial_tours:
+        cost = tour_cost(D, tour)
+        improved = True
+        while improved:
+            improved, best_delta, best_move = False, 0, None
+            for i in range(1, n - 2):
+                for k in range(i + 1, n - 1):
+                    delta = calculate_2opt_delta(D, tour, i, k)
+                    if delta < best_delta:
+                        best_delta, best_move = delta, (i, k)
+
+            if best_move:
+                i, k = best_move
+                tour = two_opt_swap(tour, i, k)
+                cost += best_delta
+                improved = True
+
+        if cost < best_cost:
+            best, best_cost = tour[:], cost
+
+    return best, best_cost
+
+def lkh_tsp_pylkh(D, tsp_nodes, depot_node, rounds=10):
+    if not LKH_AVAILABLE:
+        # Fallback se pylkh non è disponibile
+        return lkh_inspired_tsp(D, tsp_nodes, depot_node, rounds)
+    try:
+        tour_from_lkh, _ = lkh.solve_distance_matrix(D, max_trials=rounds, runs=1)
+
+        # Normalizza il tour per iniziare e finire al depot (indice 0)
+        tour_0based = [idx - 1 for idx in tour_from_lkh]
+        start_idx = tour_0based.index(0)
+        tour_normalized = tour_0based[start_idx:] + tour_0based[:start_idx]
+
+        # Assicura che il tour sia chiuso
+        if tour_normalized[-1] != 0:
+            tour_normalized.append(0)
+
+        cost = tour_cost(D, tour_normalized)
+        return tour_normalized, cost
+    except Exception as e:
+        print(f"[LKH] Errore durante l'esecuzione di pylkh: {e}. Fallback a LKH-inspired.")
+        return lkh_inspired_tsp(D, tsp_nodes, depot_node, rounds)
+
+def tsp_exact_held_karp(D):
+    n = D.shape[0]
+    if n <= 1: return [], 0
+
+    dp = defaultdict(lambda: defaultdict(lambda: (math.inf, None)))
+
+    for j in range(1, n):
+        dp[1 << (j - 1)][j] = (D[0, j], 0)
+
+    for s in range(2, n):
+        for subset_indices in itertools.combinations(range(1, n), s):
+            mask = sum(1 << (i - 1) for i in subset_indices)
+            for j in subset_indices:
+                prev_mask = mask ^ (1 << (j - 1))
+                best_cost, prev_node = math.inf, None
+                for k in subset_indices:
+                    if k == j: continue
+                    cost = dp[prev_mask][k][0] + D[k, j]
+                    if cost < best_cost:
+                        best_cost, prev_node = cost, k
+                if prev_node is not None:
+                    dp[mask][j] = (best_cost, prev_node)
+
+    full_mask = (1 << (n - 1)) - 1
+    best_cost, last_node = math.inf, None
+    for j in range(1, n):
+        cost, _ = dp[full_mask][j]
+        final_cost = cost + D[j, 0]
+        if final_cost < best_cost:
+            best_cost, last_node = final_cost, j
+
+    if last_node is None: return [], math.inf
+
+    tour = [0] * (n + 1)
+    tour[0], tour[n] = 0, 0
+    tour[n - 1] = last_node
+    current_mask, current_node = full_mask, last_node
+    for i in range(n - 2, 0, -1):
+        _, prev_node = dp[current_mask][current_node]
+        tour[i] = prev_node
+        current_mask ^= (1 << (current_node - 1))
+        current_node = prev_node
+
+    return tour, int(best_cost)
+
+# ====================== Logiche S-shape ======================
+
+def sshape_no_central_corridor(depot_node, picks_corr_nodes):
+    if not picks_corr_nodes:
+        return [depot_node], 0
+
+    active_aisles = sorted(list(set(c for r, c in picks_corr_nodes)))
+
+    waypoints = [depot_node]
+    sweep_is_up = True
+
+    for col in active_aisles:
+        entry_row = ROWS - 1 if sweep_is_up else 0
+        exit_row = 0 if sweep_is_up else ROWS - 1
+        waypoints.extend([(entry_row, col), (exit_row, col)])
+        sweep_is_up = not sweep_is_up
+
+    waypoints.append(depot_node)
+
+    seq, current_pos = [], depot_node
+    for point in waypoints:
+        path_segment = sp_path_cached(current_pos, point)
+        seq.extend(path_segment if not seq else path_segment[1:])
+        current_pos = point
+
+    return seq, len(seq) - 1
+
+def sshape_with_central_corridors(depot_node, picks_corr_nodes):
+    seq, current_pos = [depot_node], depot_node
+
+    def build_path_to(point):
+        nonlocal seq, current_pos
+        if current_pos == point: return
+        path_segment = sp_path_cached(current_pos, point)
+        seq.extend(path_segment[1:])
+        current_pos = point
+
+    num_zones = len(H_CORRIDORS) - 1
+    zone_picks = [defaultdict(list) for _ in range(num_zones)]
+
+    for r, c in picks_corr_nodes:
+        for i in range(num_zones):
+            if H_CORRIDORS[i] < r < H_CORRIDORS[i+1]:
+                zone_picks[i][c].append((r,c))
+                break
+
+    sweep_right = True
+    for i in range(num_zones - 1, -1, -1): # Dalla zona più bassa a quella più alta
+        if not zone_picks[i]: continue
+
+        top_b, bot_b = H_CORRIDORS[i], H_CORRIDORS[i+1]
+        active_aisles = sorted(zone_picks[i].keys())
+        if not sweep_right:
+            active_aisles.reverse()
+
+        sweep_up = True
+        for col in active_aisles:
+            entry_row = bot_b if sweep_up else top_b
+            exit_row = top_b if sweep_up else bot_b
+
+            build_path_to((current_pos[0], col))
+            build_path_to((entry_row, col))
+
+            picks_in_aisle = sorted(zone_picks[i][col], reverse=not sweep_up)
+            for pick in picks_in_aisle:
+                build_path_to(pick)
+
+            build_path_to((exit_row, col))
+            sweep_up = not sweep_up
+
+        sweep_right = not sweep_right
+
+    build_path_to((current_pos[0], depot_node[1]))
+    build_path_to(depot_node)
+
+    return seq, len(seq) - 1
+
+# ====================== Funzioni di Plotting ======================
+COLOR_SHELVE, COLOR_CORRIDOR, COLOR_PATH, COLOR_DEPOT, COLOR_PICK_BG = '#c8c8c8', '#ffffff', '#4169e1', '#3cb371', '#d00000'
+cmap = ListedColormap([COLOR_CORRIDOR, COLOR_SHELVE])
+
+def plot_route(title, seq, label_map, distance_steps, runtime_ms, depot_node, order_info=""):
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Adatta i limiti per il depot cosmetico
+    ax.imshow(grid, cmap=cmap, origin="upper", zorder=0)
+    ax.set_xticks(np.arange(-0.5, COLS, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, ROWS + 0.5, 1), minor=True)
+    ax.grid(which="minor", color="#888888", linewidth=0.5)
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xlim(-0.5, COLS - 0.5)
+    ax.set_ylim(ROWS + 0.5, -0.5)
+
+    # Plot del percorso
+    if len(seq) >= 2:
+        xs, ys = [c for r, c in seq], [r for r, c in seq]
+        ax.plot(xs, ys, color=COLOR_PATH, lw=2.0, zorder=4)
+        arrow_step = max(1, len(seq) // 20)
+        for i in range(0, len(seq) - 1, arrow_step):
+            u, v = seq[i], seq[i+1]
+            if u != v:
+                ax.annotate("", xy=(v[1], v[0]), xytext=(u[1], u[0]),
+                            arrowprops=dict(arrowstyle="->", color=COLOR_PATH, lw=1.5, mutation_scale=10),
+                            zorder=5)
+
+    # Plot del Depot
+    depot_c = depot_node[1]
+    ax.scatter(depot_c, ROWS, s=250, marker='s', facecolor=COLOR_DEPOT, edgecolor='black', zorder=6)
+    ax.text(depot_c, ROWS, "D", ha="center", va="center", fontsize=10, fontweight="bold", color="white", zorder=7)
+    if seq and seq[0] == depot_node:
+        ax.plot([depot_c, depot_c], [ROWS, depot_node[0]], color=COLOR_PATH, lw=2.0, zorder=4)
+
+    # Plot dei punti di picking
+    for (pr, pc), seq_num in (label_map or {}).items():
+        ax.scatter(pc, pr, s=100, marker='s', facecolor=COLOR_PICK_BG, edgecolor='black', zorder=5)
+        ax.text(pc, pr, str(seq_num), ha="center", va="center", fontsize=7, color="white", zorder=7)
+
+    dist_m = distance_steps * CELL_SIZE_M
+    full_title = f"Algoritmo: {title} ({order_info})\n"
+    full_title += f"Distanza: {dist_m:.2f} m | Runtime: {runtime_ms:.2f} ms"
+    ax.set_title(full_title, fontsize=10)
+    plt.tight_layout()
+    plt.show()
+
+def plot_boxplots(pick_size, results_data):
+    data_to_plot, labels = [], []
+    algo_order = ["S-shape", "Tabu Search", "LKH (pylkh)", "LKH-inspired", "TSP*"]
+
+    for algo in algo_order:
+        if algo in results_data:
+            distances = [d * CELL_SIZE_M for d in results_data[algo]['distances']]
+            if distances:
+                data_to_plot.append(distances)
+                labels.append(algo.replace(" (pylkh)", ""))
+
+    if not data_to_plot: return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.boxplot(data_to_plot, patch_artist=True)
+    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.set_ylabel("Distanza Totale [m]")
+    ax.set_title(f"Distribuzione Distanze per Ordini con {pick_size} Pick")
+    ax.yaxis.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# ====================== Funzioni di Mappatura per Plotting ======================
+def build_pick_sequence_and_label_map(tour_idx, tsp_nodes, corr_to_ids):
+    label_map, seen = {}, set()
+    pick_sequence_counter = 0
+    for idx in tour_idx[1:-1]:
+        node = tsp_nodes[idx]
+        for pid in corr_to_ids.get(node, []):
+            if pid not in seen:
+                seen.add(pid)
+                pick_sequence_counter += 1
+                rc = pick_cell_by_id[pid]
+                if rc not in label_map:
+                    label_map[rc] = pick_sequence_counter
+    return label_map
+
+def build_pick_sequence_and_label_map_from_polyline(seq, corr_to_ids):
+    label_map, seen = {}, set()
+    pick_sequence_counter = 0
+    for node in seq:
+        for pid in corr_to_ids.get(node, []):
+            if pid not in seen:
+                seen.add(pid)
+                pick_sequence_counter += 1
+                rc = pick_cell_by_id[pid]
+                if rc not in label_map:
+                    label_map[rc] = pick_sequence_counter
+    return label_map
+
+# =================================================================================
+# --- BLOCCO DI ESECUZIONE PRINCIPALE ---
+# =================================================================================
+
+all_results = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+
+for pick_size in PICK_SIZES:
+    print(f"\n{'='*80}\nINIZIO SIMULAZIONE PER ORDINI CON {pick_size} PICK\n{'='*80}")
+
+    indices_to_plot = random.sample(range(NUM_ORDERS_PER_SIZE), NUM_ORDERS_TO_PLOT)
+    print(f"Verranno visualizzate le mappe per gli ordini numero: {sorted([i+1 for i in indices_to_plot])}")
+
+    for i in range(NUM_ORDERS_PER_SIZE):
+        # Generazione ordine
+        order_picks = random.sample(picking_cells, pick_size)
+        order_corridor_nodes = sorted(list(set(adjacent_corridor_of_pick(r, c) for r, c in order_picks)))
+
+        corr_to_ids = defaultdict(list)
+        for (pr, pc) in order_picks:
+            corr_node = adjacent_corridor_of_pick(pr, pc)
+            corr_to_ids[corr_node].append(pick_id_of[(pr, pc)])
+
+        # --- 1. S-shape (selezione dinamica) ---
+        t0 = time.perf_counter()
+        if HAS_CENTRAL_CORRIDOR:
+            s_seq, s_steps = sshape_with_central_corridors(DEPOT_NODE, order_corridor_nodes)
+        else:
+            s_seq, s_steps = sshape_no_central_corridor(DEPOT_NODE, order_corridor_nodes)
+        t_s_ms = (time.perf_counter() - t0) * 1000.0
+        all_results[pick_size]["S-shape"]['distances'].append(s_steps)
+        all_results[pick_size]["S-shape"]['runtimes'].append(t_s_ms)
+
+        if i in indices_to_plot:
+            s_label_map = build_pick_sequence_and_label_map_from_polyline(s_seq, corr_to_ids)
+            plot_route("S-shape", s_seq, s_label_map, s_steps, t_s_ms, DEPOT_NODE, f"Pick: {pick_size}, Ordine: #{i+1}")
+
+        # --- 2. Algoritmi basati su TSP ---
+        tsp_nodes, D = build_D_with_PP(order_corridor_nodes, DEPOT_NODE)
+
+        # --- Tabu Search ---
+        t0 = time.perf_counter()
+        tabu_tour, tabu_cost = tabu_search_tsp(D, tsp_nodes, DEPOT_NODE)
+        t_tabu_ms = (time.perf_counter() - t0) * 1000.0
+        all_results[pick_size]["Tabu Search"]['distances'].append(tabu_cost)
+        all_results[pick_size]["Tabu Search"]['runtimes'].append(t_tabu_ms)
+
+        if i in indices_to_plot:
+            tabu_seq = polyline_from_tour(tsp_nodes, tabu_tour)
+            tabu_label_map = build_pick_sequence_and_label_map(tabu_tour, tsp_nodes, corr_to_ids)
+            plot_route("Tabu Search", tabu_seq, tabu_label_map, int(tabu_cost), t_tabu_ms, DEPOT_NODE, f"Pick: {pick_size}, Ordine: #{i+1}")
+
+        # --- LKH (con fallback) ---
+        t0 = time.perf_counter()
+        lkh_tour, lkh_cost = lkh_tsp_pylkh(D, tsp_nodes, DEPOT_NODE)
+        t_lkh_ms = (time.perf_counter() - t0) * 1000.0
+
+        lkh_title = "LKH (pylkh)" if LKH_AVAILABLE else "LKH-inspired"
+        all_results[pick_size][lkh_title]['distances'].append(lkh_cost)
+        all_results[pick_size][lkh_title]['runtimes'].append(t_lkh_ms)
+
+        if i in indices_to_plot:
+            lkh_seq = polyline_from_tour(tsp_nodes, lkh_tour)
+            lkh_label_map = build_pick_sequence_and_label_map(lkh_tour, tsp_nodes, corr_to_ids)
+            plot_route(lkh_title, lkh_seq, lkh_label_map, int(lkh_cost), t_lkh_ms, DEPOT_NODE, f"Pick: {pick_size}, Ordine: #{i+1}")
+
+        # --- TSP Esatto (Held-Karp) ---
+        if pick_size <= 13:
+            t0 = time.perf_counter()
+            hk_tour, hk_cost = tsp_exact_held_karp(D)
+            t_hk_ms = (time.perf_counter() - t0) * 1000.0
+
+            if not math.isinf(hk_cost):
+                all_results[pick_size]["TSP*"]['distances'].append(hk_cost)
+                all_results[pick_size]["TSP*"]['runtimes'].append(t_hk_ms)
+
+                if i in indices_to_plot:
+                    hk_seq = polyline_from_tour(tsp_nodes, hk_tour)
+                    hk_label_map = build_pick_sequence_and_label_map(hk_tour, tsp_nodes, corr_to_ids)
+                    plot_route("TSP* (Held-Karp)", hk_seq, hk_label_map, int(hk_cost), t_hk_ms, DEPOT_NODE, f"Pick: {pick_size}, Ordine: #{i+1}")
+
+    # --- Analisi Statistica e Box Plot per la dimensione di pick corrente ---
+    print(f"\n--- ANALISI STATISTICA PER {pick_size} PICK (su {NUM_ORDERS_PER_SIZE} ordini) ---")
+    summary_data = []
+
+    # Determina il riferimento per l'accuratezza
+    reference_dist = math.inf
+    if "TSP*" in all_results[pick_size]:
+        reference_dist = np.mean(all_results[pick_size]["TSP*"]['distances'])
+    else:
+        # Se TSP* non è disponibile, usa il miglior algoritmo come riferimento
+        min_avg_dist = math.inf
+        for algo in all_results[pick_size]:
+            avg_dist = np.mean(all_results[pick_size][algo]['distances'])
+            if avg_dist < min_avg_dist:
+                min_avg_dist = avg_dist
+        reference_dist = min_avg_dist
+
+    algo_order = ["S-shape", "Tabu Search", "LKH (pylkh)", "LKH-inspired", "TSP*"]
+    current_results = all_results[pick_size]
+
+    for algo in algo_order:
+        if algo in current_results:
+            data = current_results[algo]
+            avg_dist = np.mean(data['distances'])
+            var_dist = np.var(data['distances'])
+            avg_runtime = np.mean(data['runtimes'])
+
+            # Calcolo accuratezza
+            accuracy_gap = ((avg_dist - reference_dist) / reference_dist) * 100 if reference_dist > 0 else 0
+
+            summary_data.append({
+                "Algoritmo": algo,
+                "Dist. Media [m]": f"{avg_dist * CELL_SIZE_M:.2f}",
+                "Varianza Dist.": f"{var_dist:.2f}",
+                "Runtime Medio [ms]": f"{avg_runtime:.2f}",
+                "Accuratezza (Gap %)": f"{accuracy_gap:.2f}%" if algo != "TSP*" else "Riferimento"
+            })
+
+    df = pd.DataFrame(summary_data)
+    print(df.to_string(index=False))
+    print("-" * 80)
+
+    # Genera Box Plot
+    plot_boxplots(pick_size, current_results)
+
+# --- Salvataggio Cache e Fine ---
+_save_cache()
+total_wall_s = time.perf_counter() - wall_t0
+print(f"\n\n=== ESECUZIONE COMPLETA IN {total_wall_s:.2f} secondi ({total_wall_s / 60.0:.2f} minuti) ===")
