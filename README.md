@@ -2,7 +2,7 @@
 
 ## 🎓 Master's Thesis in Management Engineering
 
-This repository contains the numerical simulation models and analysis performed for the Master's Thesis in Management Engineering at the Politecnico di Bari. The core area of study is the logistics discipline, focusing specifically on the challenges of internal logistics within a warehouse.
+This repository contains the numerical simulation models and analysis performed for the Master's Thesis in Management Engineering at the Politecnico of Bari. The core area of study is the logistics discipline, focusing specifically on the challenges of internal logistics within a warehouse.
 
 **Candidate:** Alberto Piacquadio
 **Academic Year:** 2024-2025
@@ -38,7 +38,7 @@ For a robust evaluation, 500 random orders were generated for each size, testing
 ### Algorithm Implementation Details:
 
 * **TSP Exact (Held-Karp):** Used only for instances with a very small number of nodes ($N \le 13$) due to its exponential growth in computational time.
-* **Metaheuristics (TS and LKH):** These models employ a local search based on the **2-opt swap** operator to find quasi-optimal solutions efficiently, making them scalable for larger instances.
+* **Metaheuristics (TS and LKH):** These models employ a local search based on the **2-opt swap** operator to find almost-optimal solutions efficiently, making them scalable for larger instances.
 
 ---
 
@@ -48,8 +48,8 @@ The comparative analysis focused on **Average Distance (m)**, **Variance of Dist
 
 ### Summary of Findings:
 
-1.  **Optimality and Accuracy:** The TSP-based metaheuristics (**Tabu Search** and **LKH**) consistently achieved **quasi-optimal solutions** with an accuracy gap typically less than 1% compared to the theoretical optimum found by TSP Exact (or the best-found heuristic solution). Their distributions were highly concentrated, confirming superior robustness and predictability.
-2.  **Performance Trade-off:** The **LKH** algorithm generally provided the **best overall performance**, offering high solution quality with significantly lower average runtime compared to Tabu Search, especially in medium and large warehouse configurations.
+1.  **Optimality and Accuracy:** The TSP-based metaheuristics (**Tabu Search** and **LKH**) consistently achieved **almost-optimal solutions** with an accuracy gap typically less than 1% compared to the theoretical optimum found by TSP Exact (or the best-found heuristic solution). Their distributions were highly concentrated, confirming superior robustness and predictability.
+2.  **Performance Trade-off:** The **LKH** algorithm generally provided the **best overall performance**, offering high solution quality with significantly lower average runtime compared to Tabu Search, especially in small and medium warehouse configurations.
 3.  **Fixed Policy Performance:** The **S-Shape** policy was proven to be highly **ineffective** in optimizing travel distance (with a gap that could exceed 150% in the largest warehouse), but it remains **unbeatable in terms of runtime** (near $0$ ms).
 4.  **S-Shape and Saturation:** A key finding is the inverse relationship between the S-Shape's inefficiency and pick density: as the order batch size approaches the maximum capacity of the warehouse (full saturation), the optimization gap closes significantly (down to 1.92%). This suggests that S-Shape can be competitive with TSP-based algorithms in scenarios where nearly all pick points must be visited, given its superior execution speed.
 
